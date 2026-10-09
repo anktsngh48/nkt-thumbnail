@@ -96,7 +96,7 @@
     </div>
     <div id="p-new" class="pane">
       <div class="hero">
-        <p>Get a fresh design in the channel's style: bold outlined headlines, a banner, a tag chip and the Deeksha Vedantu logo. Add your teacher's photo, change the words, and press Try again until you like it.</p>
+        <p>Get a fresh design in the channel's style: bold outlined headlines, a banner, and a tag chip. Add your teacher's photo, change the words, and press Try again until you like it. The Deeksha Vedantu logo is off unless you switch it on.</p>
         <button class="primary" id="genBtn">Generate a design</button>
       </div>
     </div>
@@ -118,6 +118,8 @@
           <span class="hist" id="hist"></span>
           <button id="next" title="Next version">›</button>
           <button id="reset" hidden>Reset template</button>
+          <button id="undo" title="Undo (Ctrl+Z)" disabled>↶ Undo</button>
+          <button id="redo" title="Redo (Ctrl+Shift+Z)" disabled>↷ Redo</button>
           <span class="spacer"></span>
           <button id="save">Save</button>
           <button id="saveNew" hidden>Save as new</button>
@@ -537,7 +539,7 @@ function extractContent(d) {
   return {
     tag: t('tag', 'KCET 2027'), h1: t('h1', 'HIGH WEIGHTAGE'), h2: t('h2', 'CHAPTERS'), banner: t('banner', 'SCORE EASY'),
     photo: ph && ph.src ? { src: ph.src, srcOrig: ph.srcOrig, ar: ph.ar, tol: ph.tol, cut: ph.cut, cut0: ph.cut0 } : null,
-    logo: lo ? !lo.hidden : true
+    logo: lo ? !lo.hidden : false
   };
 }
 
@@ -708,6 +710,9 @@ const TEMPLATES = [
     tx('Line', 'ENGINEERING COLLEGES\nTHROUGH', 540, 580, 120, { fitW: 920, lh: 1.05 }),
     banner('Banner', 'KCET 2027', 540, 800, 140, '#c4161c', { fitW: 800 })]) }
 ];
+// the logo is off by default; switch it on in the Content tab
+TEMPLATES.forEach(t => { const b = t.build; t.build = () => { const d = b(); d.layers.forEach(l => { if (l.type === 'logo') l.hidden = true; }); return d; }; });
+
 
 // ---------- toast, file picking ----------
 let toastT;
@@ -845,7 +850,57 @@ function downloadBlob(blob, name) {
 }
 const slug = s => (s || 'thumbnail').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'thumbnail';
 
-const touch = () => { state.dirty = true; };
+const touch = () => { state.dirty = true; undoSchedule(); };
+
+// ---------- undo / redo ----------
+// Each design keeps a list of snapshots of its layers. Big pictures are stored once and referred to by a short key.
+const UNDO = { pool: new Map(), rev: new Map(), n: 0, timer: 0, max: 60 };
+function undoTok(v) {
+  let t = UNDO.rev.get(v);
+  if (!t) { t = '@@img' + (++UNDO.n); UNDO.rev.set(v, t); UNDO.pool.set(t, v); }
+  return t;
+}
+function snap(d) {
+  return JSON.stringify(d.layers, (k, v) => {
+    if (k[0] === '_') return undefined;
+    if ((k === 'src' || k === 'srcOrig') && typeof v === 'string' && v.length > 2000) return undoTok(v);
+    return v;
+  });
+}
+function unsnap(s) {
+  return JSON.parse(s, (k, v) => ((k === 'src' || k === 'srcOrig') && typeof v === 'string' && v.startsWith('@@img')) ? (UNDO.pool.get(v) || null) : v);
+}
+function initUndo(d) { d._undo = { stack: [snap(d)], idx: 0 }; }
+function undoSchedule() { clearTimeout(UNDO.timer); UNDO.timer = setTimeout(undoCommit, 350); }
+function undoCommit() {
+  clearTimeout(UNDO.timer); UNDO.timer = 0;
+  const d = state.design;
+  if (!d || !d._undo) return;
+  const u = d._undo, s = snap(d);
+  if (s === u.stack[u.idx]) return;
+  u.stack.length = u.idx + 1;
+  u.stack.push(s);
+  if (u.stack.length > UNDO.max) u.stack.shift();
+  u.idx = u.stack.length - 1;
+  refreshUndo();
+}
+function undoStep(dir) {
+  undoCommit();
+  const d = state.design;
+  if (!d || !d._undo) return;
+  const u = d._undo, j = u.idx + dir;
+  if (j < 0 || j >= u.stack.length) return;
+  u.idx = j;
+  d.layers = unsnap(u.stack[j]);
+  state.sel = Math.min(state.sel, d.layers.length - 1);
+  state.dirty = true;
+  buildAll(); requestRender(); refreshUndo();
+}
+function refreshUndo() {
+  const d = state.design, u = d && d._undo;
+  $('#undo').disabled = !u || u.idx <= 0;
+  $('#redo').disabled = !u || u.idx >= u.stack.length - 1;
+}
 
 // ---------- start screen ----------
 function showTab(t) {
@@ -917,6 +972,8 @@ async function importFile(file) {
 // ---------- editor open / navigate ----------
 function openEditor(mode, design, extra) {
   extra = extra || {};
+  UNDO.pool.clear(); UNDO.rev.clear(); clearTimeout(UNDO.timer);
+  initUndo(design);
   Object.assign(state, { mode, design, sel: -1, savedId: extra.savedId || null, name: extra.name || '', tplId: extra.tplId || null, dirty: false });
   state.history = mode === 'new' ? [design] : [];
   state.hidx = mode === 'new' ? 0 : -1;
@@ -928,11 +985,14 @@ function openEditor(mode, design, extra) {
   window.scrollTo(0, 0);
 }
 function setDesign(nd) {
+  undoCommit();
+  if (!nd._undo) initUndo(nd);
   state.design = nd; state.sel = -1;
   const cv = $('#cv'); cv.width = nd.W; cv.height = nd.H;
   refreshActions(); buildAll(); renderMain();
 }
 function refreshActions() {
+  refreshUndo();
   const isNew = state.mode === 'new';
   $('#again').hidden = !isNew; $('#prev').hidden = !isNew; $('#next').hidden = !isNew; $('#hist').hidden = !isNew;
   $('#reset').hidden = state.mode !== 'template';
@@ -1084,11 +1144,13 @@ function fitCutout(L) {
 async function applyPhoto(L, file) {
   try {
     const r = await fileToData(file);
+    if (!state.design || !state.design.layers.includes(L)) return;
     L.src = r.src; L.srcOrig = null; L.ar = r.w / r.h; L.cut = r.hasAlpha; L.cut0 = r.hasAlpha;
     fitCutout(L);
     let note = '';
     if (L.role === 'photo' && !r.hasAlpha) {
       const res = await removeBackground(L.src, L.tol || 38, { auto: true });
+      if (!state.design || !state.design.layers.includes(L)) return;
       if (res.ok) { L.srcOrig = L.src; L.src = res.src; L.cut = true; note = 'Background removed automatically. Fine-tune it under Edit, or restore the original.'; }
       else note = 'This photo still has its background. Use "Cut out background", or switch its style to Card or Circle.';
     }
@@ -1098,6 +1160,7 @@ async function applyPhoto(L, file) {
 }
 async function cutOut(L) {
   const res = await removeBackground(L.srcOrig || L.src, L.tol || 38, {});
+  if (!state.design || !state.design.layers.includes(L)) return;
   if (!res.ok) {
     toast(res.reason === 'transparent' ? 'This picture already has a transparent background.' :
       res.reason === 'too much' ? 'That removed almost everything. Lower the cut-out strength.' :
@@ -1350,7 +1413,21 @@ $('#prev').addEventListener('click', () => { if (state.hidx > 0) { state.hidx--;
 $('#next').addEventListener('click', () => { if (state.hidx < state.history.length - 1) { state.hidx++; setDesign(state.history[state.hidx]); } });
 $('#reset').addEventListener('click', () => {
   const t = TEMPLATES.find(x => x.id === state.tplId);
-  if (t && confirm('Reset this template? Your edits will be lost.')) { setDesign(t.build()); state.dirty = false; }
+  if (!t) return;
+  undoCommit();
+  state.design.layers = t.build().layers; state.sel = -1;
+  touch(); undoCommit(); buildAll(); requestRender();
+  toast('Template reset. Press Undo to bring your edits back.');
+});
+$('#undo').addEventListener('click', () => undoStep(-1));
+$('#redo').addEventListener('click', () => undoStep(1));
+document.addEventListener('keydown', e => {
+  if ($('#editor').hidden || !state.design || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const el_ = e.target, t = el_.tagName;
+  if (t === 'TEXTAREA' || t === 'SELECT' || (t === 'INPUT' && ['text', 'number', 'search', ''].includes(el_.type || ''))) return;
+  const k = e.key.toLowerCase();
+  if (k === 'z') { e.preventDefault(); undoStep(e.shiftKey ? 1 : -1); }
+  else if (k === 'y') { e.preventDefault(); undoStep(1); }
 });
 $('#save').addEventListener('click', () => saveDesign(false));
 $('#saveNew').addEventListener('click', () => saveDesign(true));
@@ -1367,7 +1444,7 @@ window.addEventListener('beforeunload', e => { if (state.design && state.dirty &
 initCanvas();
 
 // test hook (harmless)
-window.__nkt = { state, genDesign, extractContent, TEMPLATES, renderDesign, removeBackground, loadImg, LOGO_SRC, openEditor, buildTemplates };
+window.__nkt = { state, genDesign, extractContent, TEMPLATES, renderDesign, removeBackground, loadImg, LOGO_SRC, openEditor, buildTemplates, undoStep, undoCommit };
 
 loadImg(LOGO_SRC).then(() => showTab('new'));
 })();
